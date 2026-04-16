@@ -4,59 +4,48 @@ Universal DFMEA xlsx parser.  Supports two formats automatically detected by
 header fingerprinting:
 
   FORMAT A — AIAG-VDA 2019  (IIT Madras / Ashok Leyland new format)
-    Explicit higher / focus / lower element columns.
+    Explicit higher / focus / lower element columns per row.
     Function columns present for all three levels.
-    LLM used for: deriving functions from row data + noise factor classification.
+    LLM used for: resolving per-row element names + deriving missing functions
+                  + noise classification.
 
   FORMAT B — Legacy Ford/GM/Chrysler  (Ashok Leyland production format)
-    Single "Item / Function" column — focus system + numbered sub-items.
-    "Requirement" column = function statement.
-    No higher-level element column.
+    Single "Item / Function" column.  No element columns.
     LLM used for:
-      - Derive focus function from failure mode / requirement text
-      - Extract lower-level function from cause description
-      - Derive higher-level function from failure effect text
-      - Classify noise factors from cause text
+      - Match cause text  → lower element  (from user-supplied list)
+      - Match effect text → higher element (from user-supplied list)
+      - Derive focus / higher / lower function statements per row
+      - Classify noise factors
 
-IMPORTANT: Element names (focus, higher, lower) are NOT inferred by the parser.
-They must be provided by the caller via the `elements` parameter to
-`parse_dfmea_file()`. The parser derives FUNCTIONS and CONNECTIONS from row data.
-
-Both formats produce the same output schema:
+IMPORTANT: Element names are NOT inferred by the parser.
+They must be provided by the caller:
   {
-    focus_element:    str,
-    higher_element:   str,
-    lower_element:    str,
-    focus_functions:  str[],
-    higher_functions: str[],
-    lower_functions:  str[],
-    connections: [
-      {
-        lower_fn:     str,   # what lower function…
-        focus_fn:     str,   # …affects what focus function…
-        higher_fn:    str,   # …which affects what higher function
-        row_index:    int,   # source row for traceability
-      }
-    ],
-    failure_modes: [{
-      focus_fn, failure_mode, failure_effect,
-      severity, occurrence, detection, rpn,
-      classification, prevention_controls, detection_controls,
-      causes: [{
-        lower_fn, cause_text,
-        noise_driven, noise_category, noise_factor,
-        occurrence, detection
-      }]
-    }],
-    noise_factors: {
-      pieceTopiece, changeOverTime, customerUsage,
-      externalEnvironment, systemInteractions
-    }
+    focus_element:   str         — single focus system name
+    higher_elements: list[str]   — one or more higher system names
+    lower_elements:  list[str]   — one or more lower component names
   }
 
-Usage:
-  python dfmea_universal_parser.py <path_to_xlsx> [sheet_name]
-  # Elements must be passed programmatically via parse_dfmea_file(path, elements={...})
+Output schema:
+  {
+    focus_element:    str,
+    higher_elements:  [{ name, functions[] }],
+    lower_elements:   [{ name, functions[] }],
+    focus_functions:  str[],
+    connections: [
+      { lower_element, lower_fn, focus_fn, higher_element, higher_fn, row_index }
+    ],
+    failure_modes: [{
+      focus_fn, failure_mode, failure_effect, severity, classification,
+      causes: [{
+        lower_element, lower_fn, higher_element, higher_fn, cause_text,
+        noise_driven, noise_category, noise_factor,
+        occurrence, detection, rpn, ap,
+        prevention_controls, detection_controls,
+      }]
+    }],
+    noise_factors: { pieceTopiece, changeOverTime, customerUsage,
+                     externalEnvironment, systemInteractions }
+  }
 """
 
 from __future__ import annotations
@@ -66,21 +55,23 @@ import json
 import uuid
 from pathlib import Path
 from collections import defaultdict
-from typing import Any
+from typing import Any, Iterable, List
 
 import pandas as pd
-
-# ─────────────────────────────────────────────────────────────────────────────
-# LLM CLIENT  (same interface as existing llm_client.py)
-# ─────────────────────────────────────────────────────────────────────────────
-
 import os
 import requests
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LLM CLIENT
+# ─────────────────────────────────────────────────────────────────────────────
 
 _BEDROCK_REGION = os.environ.get("BEDROCK_REGION", "ap-south-1")
 _BEDROCK_MODEL  = os.environ.get("BEDROCK_MODEL",  "anthropic.claude-3-sonnet-20240229-v1:0")
 _BEDROCK_KEY    = os.environ.get("BEDROCK_API_KEY", "")
-_BEDROCK_URL    = f"https://bedrock-runtime.{_BEDROCK_REGION}.amazonaws.com/model/{_BEDROCK_MODEL}/invoke"
+_BEDROCK_URL    = (
+    f"https://bedrock-runtime.{_BEDROCK_REGION}.amazonaws.com"
+    f"/model/{_BEDROCK_MODEL}/invoke"
+)
 
 _SYSTEM = (
     "You are an expert DFMEA engineer following AIAG-VDA methodology. "
@@ -88,21 +79,21 @@ _SYSTEM = (
 )
 
 
-from typing import Iterable, List
-
-def chunked(seq: List[str], size: int) -> Iterable[List[str]]:
+def chunked(seq: List, size: int) -> Iterable[List]:
     for i in range(0, len(seq), size):
         yield seq[i:i + size]
 
 
 def _llm(prompt: str, function: str, max_tokens: int = 1024) -> str:
-    """Call AWS Bedrock. Falls back to stub if no key is set (for testing)."""
     if not _BEDROCK_KEY:
         return _llm_stub(prompt)
-    headers = {"Authorization": f"Bearer {_BEDROCK_KEY}", "Content-Type": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {_BEDROCK_KEY}",
+        "Content-Type": "application/json",
+    }
     payload = {
         "anthropic_version": "bedrock-2023-05-31",
-        "system":  _SYSTEM,
+        "system": _SYSTEM,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "temperature": 0.3,
@@ -110,41 +101,35 @@ def _llm(prompt: str, function: str, max_tokens: int = 1024) -> str:
     resp = requests.post(_BEDROCK_URL, headers=headers, json=payload, timeout=60)
     resp.raise_for_status()
     body = resp.json()
-
     stop_reason = body.get("stop_reason", "")
     if stop_reason == "max_tokens":
-        print(
-            f"[llm WARNING] '{function}' hit max_tokens={max_tokens} — "
-            "output was TRUNCATED. Increase max_tokens for this call."
-        )
-
+        print(f"[llm WARNING] '{function}' hit max_tokens={max_tokens} — TRUNCATED.")
     text = body["content"][0]["text"].strip()
-    print(f"[llm] {function} ({max_tokens} tok cap, stop={stop_reason!r}): {text[:120]}{'…' if len(text) > 120 else ''}")
+    print(
+        f"[llm] {function} ({max_tokens} tok, stop={stop_reason!r}): "
+        f"{text[:120]}{'…' if len(text) > 120 else ''}"
+    )
     return text
 
 
 def _llm_stub(prompt: str) -> str:
-    """Offline stub — returns deterministic placeholder JSON."""
-    if "focus function" in prompt.lower() and "failure mode" in prompt.lower():
-        return "Perform intended function"
-    if "lower" in prompt.lower() and "function" in prompt.lower() and "cause" in prompt.lower():
-        return json.dumps({
-            "lower_fn": "Perform sub-component function",
-        })
-    if "higher" in prompt.lower() and "function" in prompt.lower() and "effect" in prompt.lower():
-        return json.dumps({
-            "higher_fn": "Maintain system-level operation",
-        })
-    if "noise" in prompt.lower():
-        return json.dumps({
-            "noise_driven": False,
-            "noise_category": None,
-            "noise_factor": None,
-        })
-    if "functions" in prompt.lower() and "batch" in prompt.lower():
+    """Offline stub — deterministic placeholders for unit testing."""
+    p = prompt.lower()
+    if "match" in p and ("lower element" in p or "higher element" in p):
+        arr = re.findall(r'"([^"]+)"', prompt)
+        return json.dumps({"matched_element": arr[0] if arr else "Unknown"})
+    if "batch" in p and "function" in p:
         return json.dumps([
-            {"focus_fn": "Perform intended function", "higher_fn": "Maintain system operation", "lower_fn": "Perform sub-function"}
+            {
+                "focus_fn":  "Perform intended function",
+                "higher_fn": "Maintain system operation",
+                "lower_fn":  "Perform sub-component function",
+            }
         ])
+    if "noise" in p:
+        return json.dumps(
+            {"noise_driven": False, "noise_category": None, "noise_factor": None}
+        )
     return "{}"
 
 
@@ -155,10 +140,12 @@ def _llm_stub(prompt: str) -> str:
 def _uid() -> str:
     return str(uuid.uuid4())[:8]
 
+
 def _s(v: Any) -> str:
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return ""
     return str(v).strip()
+
 
 def _int(v: Any) -> int | None:
     try:
@@ -166,16 +153,19 @@ def _int(v: Any) -> int | None:
     except (ValueError, TypeError):
         return None
 
+
 def _strip_json(text: str) -> str:
     text = re.sub(r"^```(?:json)?\s*", "", text.strip())
     text = re.sub(r"\s*```$", "", text)
     return text.strip()
+
 
 def _parse_json(text: str) -> dict:
     try:
         return json.loads(_strip_json(text))
     except Exception:
         return {}
+
 
 def _parse_json_array(text: str) -> list:
     try:
@@ -212,10 +202,13 @@ def detect_format(header_values: list[str]) -> str:
 def find_header_row(df: pd.DataFrame) -> int:
     for i in range(min(20, len(df))):
         row_text = " ".join(_s(v).lower() for v in df.iloc[i].tolist())
-        hits = sum(1 for kw in (
-            "item", "function", "failure mode", "severity", "occurrence",
-            "detection", "cause", "effect", "requirement", "next higher",
-        ) if kw in row_text)
+        hits = sum(
+            1 for kw in (
+                "item", "function", "failure mode", "severity", "occurrence",
+                "detection", "cause", "effect", "requirement", "next higher",
+            )
+            if kw in row_text
+        )
         if hits >= 3:
             return i
     return 0
@@ -225,10 +218,15 @@ def find_header_row(df: pd.DataFrame) -> int:
 # COLUMN MAPPER
 # ─────────────────────────────────────────────────────────────────────────────
 
-_AIAG_SEMANTIC = {
+_AIAG_SEMANTIC: dict[str, list[str]] = {
+    # Per-row element name columns (AIAG-VDA has these explicitly)
+    "higher_element_col": ["next higher level element", "next higher level", "higher level element"],
+    "lower_element_col":  ["next lower level element",  "next lower level",  "lower level element"],
+    # Function columns
     "higher_fn":      ["next higher level function", "higher level function"],
     "focus_fn":       ["focus element function", "focus function"],
     "lower_fn":       ["next lower level function", "lower level function"],
+    # Failure analysis
     "failure_effect": ["failure effect (fe)", "failure effect to the next higher"],
     "severity":       ["severity (s) of failure", "severity (s)"],
     "classification": ["classification"],
@@ -241,7 +239,7 @@ _AIAG_SEMANTIC = {
     "ap":             ["ap"],
 }
 
-_LEGACY_SEMANTIC = {
+_LEGACY_SEMANTIC: dict[str, list[str]] = {
     "item_function":  ["item / function", "item/function", "item", "function"],
     "requirement":    ["requirement"],
     "failure_mode":   ["potential failure mode", "failure mode"],
@@ -265,14 +263,97 @@ def map_columns(header_row: list[str], fmt: str) -> dict[str, int]:
             h = _s(raw_h).lower().strip()
             if not h:
                 continue
-            if any(kw in h for kw in keywords):
-                if semantic not in result:
-                    result[semantic] = ci
+            if any(kw in h for kw in keywords) and semantic not in result:
+                result[semantic] = ci
     return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# NOISE CLASSIFICATION  (LLM-assisted)
+# ELEMENT MATCHING  — resolve per-row element from user-supplied candidate list
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fuzzy_match(cell: str, candidates: list[str]) -> str | None:
+    """Fast substring / token overlap match; returns None if ambiguous."""
+    if not cell or not candidates:
+        return None
+    cl = cell.lower()
+    # Exact
+    for c in candidates:
+        if c.lower() == cl:
+            return c
+    # Substring
+    for c in candidates:
+        if c.lower() in cl or cl in c.lower():
+            return c
+    # Token overlap (≥1 common token)
+    cell_toks = set(re.split(r"[\s\-_/]+", cl))
+    best, best_score = None, 0
+    for c in candidates:
+        score = len(cell_toks & set(re.split(r"[\s\-_/]+", c.lower())))
+        if score > best_score:
+            best_score, best = score, c
+    return best if best_score >= 1 else None
+
+
+def llm_batch_match_elements(
+    cell_values: list[str],
+    candidates: list[str],
+    level: str = "lower",
+) -> dict[str, str]:
+    """
+    Map each unique cell value to one of the user-supplied candidate element names.
+    Fast-path: fuzzy match; LLM called only for unresolved values.
+    Returns { cell_value: matched_element_name }.
+    """
+    result: dict[str, str] = {}
+    needs_llm: list[str] = []
+
+    for cv in cell_values:
+        m = _fuzzy_match(cv, candidates)
+        if m is not None:
+            result[cv] = m
+        else:
+            needs_llm.append(cv)
+
+    if not needs_llm:
+        return result
+
+    rows_text = "\n".join(f'{i+1}. "{cv}"' for i, cv in enumerate(needs_llm))
+    prompt = f"""Match each DFMEA {level}-level element cell value to the closest
+entry in the user-supplied element list below.
+
+Valid {level}-level element names:
+{json.dumps(candidates)}
+
+Cell values (one per line):
+{rows_text}
+
+Output ONLY a valid JSON array with one object per cell value, in order:
+[
+  {{"cell": "<cell value>", "matched_element": "<element from list>"}},
+  ...
+]"""
+
+    token_budget = min(4096, max(256, len(needs_llm) * 60 + 256))
+    raw = _llm(prompt, f"llm_batch_match_elements_{level}", max_tokens=token_budget)
+    parsed = _parse_json_array(raw)
+
+    for entry in parsed:
+        cv      = entry.get("cell", "")
+        matched = entry.get("matched_element", "")
+        if cv in needs_llm and matched in candidates:
+            result[cv] = matched
+
+    # Final fallback: fuzzy or first candidate
+    for cv in needs_llm:
+        if cv not in result:
+            result[cv] = _fuzzy_match(cv, candidates) or candidates[0]
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NOISE CLASSIFICATION
 # ─────────────────────────────────────────────────────────────────────────────
 
 _NOISE_RE = re.compile(
@@ -283,9 +364,12 @@ _NOISE_RE = re.compile(
     re.IGNORECASE,
 )
 
-_NOISE_CATS = ["pieceTopiece", "changeOverTime", "customerUsage", "externalEnvironment", "systemInteractions"]
+_NOISE_CATS = [
+    "pieceTopiece", "changeOverTime", "customerUsage",
+    "externalEnvironment", "systemInteractions",
+]
 
-_CAT_KEYWORDS = {
+_CAT_KEYWORDS: dict[str, list[str]] = {
     "pieceTopiece":        ["dimension", "tolerance", "variation", "manufacturing", "assembly", "material property"],
     "changeOverTime":      ["wear", "fatigue", "corrosion", "age", "degrade", "creep", "drift", "life", "cycle"],
     "customerUsage":       ["overload", "load", "road", "speed", "duty cycle", "misuse", "abuse", "operator"],
@@ -295,281 +379,176 @@ _CAT_KEYWORDS = {
 
 
 def classify_cause_noise(cause_text: str, use_llm: bool = True) -> dict:
-    """
-    Given a failure cause string, determine:
-      - noise_driven:   bool
-      - noise_category: str (one of 5 P-diagram categories, or None)
-      - noise_factor:   str (concise label, or None)
-    """
     if not cause_text.strip():
         return {"noise_driven": False, "noise_category": None, "noise_factor": None}
-
     if not _NOISE_RE.search(cause_text):
         return {"noise_driven": False, "noise_category": None, "noise_factor": None}
 
     if not use_llm:
-        cat = _classify_cat_by_keywords(cause_text)
-        factor = _extract_factor_regex(cause_text)
+        tl = cause_text.lower()
+        scores = {cat: sum(1 for kw in kws if kw in tl) for cat, kws in _CAT_KEYWORDS.items()}
+        cat = max(scores, key=lambda k: scores[k])
+        m = re.search(r"due to (.+?)(?:\.|$)", cause_text, re.IGNORECASE)
+        factor = m.group(1).strip()[:80] if m else cause_text[:60]
         return {"noise_driven": True, "noise_category": cat, "noise_factor": factor}
 
-    prompt = f"""Analyse this DFMEA failure cause and assume it is driven by a noise factor (external condition):
+    prompt = f"""Analyse this DFMEA failure cause. Assume it is noise-driven.
 
 Failure cause: "{cause_text}"
 
-A noise factor is an external condition that the design cannot control, such as:
-- Operating environment (temperature, humidity, salt, dust, wading)  
-- Customer usage pattern (overloading, road type, duty cycle)
-- Material variation / piece-to-piece variation
-- System-level interactions from adjacent systems
-- Change over time (wear, fatigue, corrosion)
-
-Output ONLY valid JSON, no markdown:
+Output ONLY valid JSON:
 {{
   "noise_driven": true,
   "noise_category": <"pieceTopiece"|"changeOverTime"|"customerUsage"|"externalEnvironment"|"systemInteractions"|null>,
-  "noise_factor": <"short label for the specific factor e.g. '+52°C high temperature', 'salt pan corrosion', 'overloading 150%'"|null>
+  "noise_factor": <"concise label e.g. '+52 deg C ambient', 'salt spray corrosion'"|null>
 }}"""
-
     raw = _llm(prompt, "classify_cause_noise", max_tokens=150)
-    result = _parse_json(raw)
+    r   = _parse_json(raw)
     return {
-        "noise_driven":   bool(result.get("noise_driven", True)),
-        "noise_category": result.get("noise_category"),
-        "noise_factor":   result.get("noise_factor"),
+        "noise_driven":   bool(r.get("noise_driven", True)),
+        "noise_category": r.get("noise_category"),
+        "noise_factor":   r.get("noise_factor"),
     }
 
 
-def _classify_cat_by_keywords(text: str) -> str:
-    text_l = text.lower()
-    scores = {cat: sum(1 for kw in kws if kw in text_l) for cat, kws in _CAT_KEYWORDS.items()}
-    return max(scores, key=lambda k: scores[k])
-
-
-def _extract_factor_regex(text: str) -> str | None:
-    m = re.search(r"due to (.+?)(?:\.|$)", text, re.IGNORECASE)
-    if m:
-        return m.group(1).strip()[:80]
-    return text[:60]
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# ROW-LEVEL FUNCTION DERIVATION  (LLM-assisted)
+# ROW-LEVEL FUNCTION DERIVATION
 # ─────────────────────────────────────────────────────────────────────────────
 
-def llm_derive_row_functions(
-    focus_element: str,
-    higher_element: str,
-    lower_element: str,
-    failure_mode: str,
-    failure_effect: str,
-    failure_cause: str,
-    requirement: str = "",
-    existing_focus_fn: str = "",
-    existing_higher_fn: str = "",
-    existing_lower_fn: str = "",
-) -> dict:
+def llm_batch_derive_row_functions(rows_data: list[dict]) -> list[dict | None]:
     """
-    Given a single DFMEA row's data and the three element names (user-supplied),
-    derive the function statements for each level:
-      - focus_fn:  what the focus element does
-      - higher_fn: what the higher element does (that is affected by focus failures)
-      - lower_fn:  what the lower element does (that causes focus failures)
+    Derive focus_fn / higher_fn / lower_fn for every row in one batched LLM call.
 
-    If functions are already present in the spreadsheet (explicit columns),
-    those are passed in as existing_* and returned as-is — LLM is only called
-    for the missing ones.
+    Each entry in rows_data must have:
+      focus_element, higher_element, lower_element  — ACTUAL per-row element names
+      failure_mode, failure_effect, failure_cause, requirement
+      existing_focus_fn, existing_higher_fn, existing_lower_fn
 
-    Returns: { focus_fn: str, higher_fn: str, lower_fn: str }
-    """
-    result = {
-        "focus_fn":  existing_focus_fn,
-        "higher_fn": existing_higher_fn,
-        "lower_fn":  existing_lower_fn,
-    }
-
-    need_focus  = not existing_focus_fn.strip()
-    need_higher = not existing_higher_fn.strip()
-    need_lower  = not existing_lower_fn.strip()
-
-    if not need_focus and not need_higher and not need_lower:
-        return result  # All already present — skip LLM call
-
-    req_ctx = f"\nRequirement / function statement in sheet: \"{requirement}\"" if requirement else ""
-    cause_ctx = f"\nFailure cause (what the lower element did wrong): \"{failure_cause}\"" if failure_cause else ""
-    effect_ctx = f"\nFailure effect (what went wrong at higher level): \"{failure_effect}\"" if failure_effect else ""
-
-    needed_fields = []
-    if need_focus:
-        needed_fields.append(
-            f'  "focus_fn": "<positive function of {focus_element} that this failure mode violates>"'
-        )
-    if need_higher:
-        needed_fields.append(
-            f'  "higher_fn": "<positive function of {higher_element} that is impaired when focus element fails>"'
-        )
-    if need_lower:
-        needed_fields.append(
-            f'  "lower_fn": "<positive function of {lower_element} that contributes to the focus function when working correctly>"'
-        )
-
-    fields_str = ",\n".join(needed_fields)
-
-    prompt = f"""You are writing a DFMEA function statement for each level of a 3-level hierarchy.
-
-Elements:
-  Higher-level element : "{higher_element}"
-  Focus element        : "{focus_element}"
-  Lower-level element  : "{lower_element}"
-
-Row data from spreadsheet:
-  Failure mode  (focus level):  "{failure_mode}"{req_ctx}{effect_ctx}{cause_ctx}
-
-Rules:
-- Each function is a positive statement: verb + object (e.g. "Transmit braking torque")
-- Focus function: what {focus_element} is supposed to do (negation of its failure mode)
-- Higher function: what {higher_element} is supposed to achieve (impaired by the failure effect)
-- Lower function: what {lower_element} contributes to the focus function (negated by the failure cause)
-- Keep each function concise (≤12 words)
-
-Output ONLY valid JSON with exactly these keys:
-{{
-{fields_str}
-}}"""
-
-    token_budget = 80 * len(needed_fields) + 128
-    raw = _llm(prompt, "llm_derive_row_functions", max_tokens=token_budget)
-    parsed = _parse_json(raw)
-
-    if need_focus  and parsed.get("focus_fn"):  result["focus_fn"]  = parsed["focus_fn"]
-    if need_higher and parsed.get("higher_fn"): result["higher_fn"] = parsed["higher_fn"]
-    if need_lower  and parsed.get("lower_fn"):  result["lower_fn"]  = parsed["lower_fn"]
-
-    return result
-
-
-def llm_batch_derive_row_functions(
-    rows_data: list[dict],
-    focus_element: str,
-    higher_element: str,
-    lower_element: str,
-) -> list[dict]:
-    """
-    Batch version of llm_derive_row_functions — processes multiple rows in one LLM call.
-    Each entry in rows_data must have: failure_mode, failure_effect, failure_cause,
-    requirement (optional), existing_focus_fn, existing_higher_fn, existing_lower_fn.
-
-    Returns a list of { focus_fn, higher_fn, lower_fn } dicts, same length as rows_data.
+    Returns list[{focus_fn, higher_fn, lower_fn}], same length as input.
+    Rows with all three functions already filled are short-circuited (no LLM call).
     """
     if not rows_data:
         return []
 
-    # Pre-fill rows that already have all three functions
-    results = [None] * len(rows_data)
-    indices_needing_llm = []
+    results: list[dict | None] = [None] * len(rows_data)
+    need_llm: list[int] = []
 
     for i, rd in enumerate(rows_data):
-        if (rd.get("existing_focus_fn") and
-                rd.get("existing_higher_fn") and
-                rd.get("existing_lower_fn")):
+        if rd.get("existing_focus_fn") and rd.get("existing_higher_fn") and rd.get("existing_lower_fn"):
             results[i] = {
                 "focus_fn":  rd["existing_focus_fn"],
                 "higher_fn": rd["existing_higher_fn"],
                 "lower_fn":  rd["existing_lower_fn"],
             }
         else:
-            indices_needing_llm.append(i)
+            need_llm.append(i)
 
-    if not indices_needing_llm:
-        return results
+    if not need_llm:
+        return results  # type: ignore[return-value]
 
-    # Build batch prompt for rows that need LLM
     rows_text = ""
-    for seq, i in enumerate(indices_needing_llm, start=1):
+    for seq, i in enumerate(need_llm, 1):
         rd = rows_data[i]
         rows_text += f"""
 Row {seq}:
-  failure_mode  : "{rd.get('failure_mode', '')}"
-  failure_effect: "{rd.get('failure_effect', '')}"
-  failure_cause : "{rd.get('failure_cause', '')}"
-  requirement   : "{rd.get('requirement', '')}"
+  higher_element    : "{rd.get('higher_element', '')}"
+  focus_element     : "{rd.get('focus_element', '')}"
+  lower_element     : "{rd.get('lower_element', '')}"
+  failure_mode      : "{rd.get('failure_mode', '')}"
+  failure_effect    : "{rd.get('failure_effect', '')}"
+  failure_cause     : "{rd.get('failure_cause', '')}"
+  requirement       : "{rd.get('requirement', '')}"
   existing_focus_fn : "{rd.get('existing_focus_fn', '')}"
   existing_higher_fn: "{rd.get('existing_higher_fn', '')}"
   existing_lower_fn : "{rd.get('existing_lower_fn', '')}"
 """
 
-    prompt = f"""You are writing DFMEA function statements for a 3-level element hierarchy.
+    prompt = f"""Write DFMEA function statements for these rows. Each row has its own
+element names — use those exact names, not generic labels.
 
-Elements:
-  Higher-level element : "{higher_element}"
-  Focus element        : "{focus_element}"
-  Lower-level element  : "{lower_element}"
+Rules:
+- focus_fn  : positive function of focus_element that the failure_mode violates
+- higher_fn : positive function of higher_element impaired by failure_effect
+- lower_fn  : positive function of lower_element negated by failure_cause
+- Format: verb + object, ≤12 words (e.g. "Transmit braking torque")
+- If existing_*_fn is non-empty, echo it back unchanged
 
-Rules for function statements:
-- Positive verb + object (e.g. "Transmit braking torque", "Maintain suspension geometry")
-- focus_fn : what {focus_element} is supposed to do (negation of its failure mode)
-- higher_fn: what {higher_element} must achieve (impaired when focus element fails)
-- lower_fn : what {lower_element} contributes (negated by the failure cause)
-- If an existing_*_fn is already provided in the row, echo it back unchanged
-- Keep each function concise (≤12 words)
-
-For each row below, output one JSON object with keys: focus_fn, higher_fn, lower_fn.
-Return a JSON ARRAY of {len(indices_needing_llm)} objects, one per row, in order.
+Return a JSON ARRAY of {len(need_llm)} objects, one per row, in order:
+[
+  {{"focus_fn": "...", "higher_fn": "...", "lower_fn": "..."}},
+  ...
+]
 
 Rows:
 {rows_text}
 
-Output ONLY valid JSON array, no markdown:
-[
-  {{"focus_fn": "...", "higher_fn": "...", "lower_fn": "..."}},
-  ...
-]"""
+Output ONLY valid JSON array."""
 
-    token_budget = min(8192, max(512, len(indices_needing_llm) * 120 + 256))
+    token_budget = min(8192, max(512, len(need_llm) * 130 + 256))
     raw = _llm(prompt, "llm_batch_derive_row_functions", max_tokens=token_budget)
 
     try:
         parsed_list = json.loads(_strip_json(raw))
-        if isinstance(parsed_list, list) and len(parsed_list) == len(indices_needing_llm):
-            for seq, i in enumerate(indices_needing_llm):
-                results[i] = {
-                    "focus_fn":  parsed_list[seq].get("focus_fn", ""),
-                    "higher_fn": parsed_list[seq].get("higher_fn", ""),
-                    "lower_fn":  parsed_list[seq].get("lower_fn", ""),
-                }
-            return results
-        # Partial result — fall back per-row for remainder
-        if isinstance(parsed_list, list) and len(parsed_list) > 0:
-            for seq, i in enumerate(indices_needing_llm[:len(parsed_list)]):
-                results[i] = {
-                    "focus_fn":  parsed_list[seq].get("focus_fn", ""),
-                    "higher_fn": parsed_list[seq].get("higher_fn", ""),
-                    "lower_fn":  parsed_list[seq].get("lower_fn", ""),
-                }
-            for i in indices_needing_llm[len(parsed_list):]:
-                rd = rows_data[i]
-                results[i] = llm_derive_row_functions(
-                    focus_element, higher_element, lower_element,
-                    rd.get("failure_mode", ""), rd.get("failure_effect", ""),
-                    rd.get("failure_cause", ""), rd.get("requirement", ""),
-                    rd.get("existing_focus_fn", ""), rd.get("existing_higher_fn", ""),
-                    rd.get("existing_lower_fn", ""),
-                )
-            return results
+        if isinstance(parsed_list, list):
+            for seq, i in enumerate(need_llm):
+                if seq < len(parsed_list):
+                    results[i] = {
+                        "focus_fn":  parsed_list[seq].get("focus_fn", ""),
+                        "higher_fn": parsed_list[seq].get("higher_fn", ""),
+                        "lower_fn":  parsed_list[seq].get("lower_fn", ""),
+                    }
+                else:
+                    results[i] = _llm_derive_single(rows_data[i])
+            return results  # type: ignore[return-value]
     except Exception:
         pass
 
-    # Full fallback — one call per row
-    print("[llm WARNING] llm_batch_derive_row_functions: JSON parse failed, falling back to per-row calls.")
-    for i in indices_needing_llm:
-        rd = rows_data[i]
-        results[i] = llm_derive_row_functions(
-            focus_element, higher_element, lower_element,
-            rd.get("failure_mode", ""), rd.get("failure_effect", ""),
-            rd.get("failure_cause", ""), rd.get("requirement", ""),
-            rd.get("existing_focus_fn", ""), rd.get("existing_higher_fn", ""),
-            rd.get("existing_lower_fn", ""),
-        )
-    return results
+    print("[llm WARNING] llm_batch_derive_row_functions: parse failed, per-row fallback.")
+    for i in need_llm:
+        results[i] = _llm_derive_single(rows_data[i])
+    return results  # type: ignore[return-value]
+
+
+def _llm_derive_single(rd: dict) -> dict:
+    """Single-row fallback for function derivation."""
+    focus_el  = rd.get("focus_element",  "focus element")
+    higher_el = rd.get("higher_element", "higher element")
+    lower_el  = rd.get("lower_element",  "lower element")
+
+    fields: list[str] = []
+    if not rd.get("existing_focus_fn"):
+        fields.append(f'  "focus_fn": "<function of {focus_el}>"')
+    if not rd.get("existing_higher_fn"):
+        fields.append(f'  "higher_fn": "<function of {higher_el}>"')
+    if not rd.get("existing_lower_fn"):
+        fields.append(f'  "lower_fn": "<function of {lower_el}>"')
+
+    if not fields:
+        return {
+            "focus_fn":  rd["existing_focus_fn"],
+            "higher_fn": rd["existing_higher_fn"],
+            "lower_fn":  rd["existing_lower_fn"],
+        }
+
+    prompt = f"""Derive DFMEA function statements.
+
+Higher: "{higher_el}" | Focus: "{focus_el}" | Lower: "{lower_el}"
+Failure mode  : "{rd.get('failure_mode', '')}"
+Failure effect: "{rd.get('failure_effect', '')}"
+Failure cause : "{rd.get('failure_cause', '')}"
+Requirement   : "{rd.get('requirement', '')}"
+
+Output ONLY valid JSON:
+{{
+{chr(10).join(fields)}
+}}"""
+    raw    = _llm(prompt, "_llm_derive_single", max_tokens=len(fields) * 80 + 100)
+    parsed = _parse_json(raw)
+    return {
+        "focus_fn":  parsed.get("focus_fn",  rd.get("existing_focus_fn",  "")),
+        "higher_fn": parsed.get("higher_fn", rd.get("existing_higher_fn", "")),
+        "lower_fn":  parsed.get("lower_fn",  rd.get("existing_lower_fn",  "")),
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -578,121 +557,152 @@ Output ONLY valid JSON array, no markdown:
 
 def parse_aiag_vda(df: pd.DataFrame, col: dict[str, int], elements: dict) -> dict:
     """
-    Parse AIAG-VDA 2019 format DataFrame.
+    Parse AIAG-VDA 2019 format.
 
-    `elements` must contain: focus_element, higher_element, lower_element
-    (user-supplied at wizard step, not inferred from data).
+    Per-row element resolution:
+      - focus_element  : always user-supplied single string
+      - higher_element : read from 'next higher level element' column → matched to
+                         elements['higher_elements'] list via fuzzy + LLM
+      - lower_element  : read from 'next lower level element' column  → matched to
+                         elements['lower_elements']  list via fuzzy + LLM
 
-    For each row, functions are:
-      - Read from explicit function columns if present
-      - Otherwise derived via LLM from failure_mode / failure_effect / failure_cause
-    Connections are built from co-occurrence in the same row.
+    Functions read from explicit columns if present, else LLM-derived.
+    Connections built from row co-occurrence with fully qualified element names.
     """
-    focus_element  = elements.get("focus_element",  "Focus System")
-    higher_element = elements.get("higher_element", "Higher System")
-    lower_element  = elements.get("lower_element",  "Lower Component")
+    focus_element     = elements["focus_element"]
+    higher_candidates = elements["higher_elements"]
+    lower_candidates  = elements["lower_elements"]
 
-    # ── Collect raw row data ──────────────────────────────────────────────────
-    raw_rows_input: list[dict] = []
+    has_higher_col = "higher_element_col" in col
+    has_lower_col  = "lower_element_col"  in col
+
+    # ── Pass 1: Collect raw rows ──────────────────────────────────────────────
+    raw_rows: list[dict] = []
     for _, row in df.iterrows():
-        higher_fn_existing = _s(row.get(col.get("higher_fn",  -1), ""))
-        focus_fn_existing  = _s(row.get(col.get("focus_fn",   -1), ""))
-        lower_fn_existing  = _s(row.get(col.get("lower_fn",   -1), ""))
-        fe  = _s(row.get(col.get("failure_effect", -1), ""))
-        sev = _int(row.get(col.get("severity",     -1), ""))
-        fm  = _s(row.get(col.get("failure_mode",   -1), ""))
-        fc  = _s(row.get(col.get("failure_cause",  -1), ""))
-        prev    = _s(row.get(col.get("prevention",     -1), ""))
-        occ     = _int(row.get(col.get("occurrence",   -1), ""))
-        det_ctrl = _s(row.get(col.get("detection_ctrl",-1), ""))
-        det     = _int(row.get(col.get("detection",    -1), ""))
-        cls     = _s(row.get(col.get("classification", -1), ""))
-        ap      = _s(row.get(col.get("ap",            -1), ""))
+        higher_cell       = _s(row.get(col.get("higher_element_col", -1), "")) if has_higher_col else ""
+        lower_cell        = _s(row.get(col.get("lower_element_col",  -1), "")) if has_lower_col  else ""
+        higher_fn_exist   = _s(row.get(col.get("higher_fn",          -1), ""))
+        focus_fn_exist    = _s(row.get(col.get("focus_fn",           -1), ""))
+        lower_fn_exist    = _s(row.get(col.get("lower_fn",           -1), ""))
+        fe   = _s(row.get(col.get("failure_effect",  -1), ""))
+        sev  = _int(row.get(col.get("severity",      -1), ""))
+        fm   = _s(row.get(col.get("failure_mode",    -1), ""))
+        fc   = _s(row.get(col.get("failure_cause",   -1), ""))
+        prev = _s(row.get(col.get("prevention",      -1), ""))
+        occ  = _int(row.get(col.get("occurrence",    -1), ""))
+        dc   = _s(row.get(col.get("detection_ctrl",  -1), ""))
+        det  = _int(row.get(col.get("detection",     -1), ""))
+        cls  = _s(row.get(col.get("classification",  -1), ""))
+        ap   = _s(row.get(col.get("ap",              -1), ""))
 
         if not fm and not fc:
             continue
 
-        raw_rows_input.append({
+        raw_rows.append({
+            "_higher_cell":       higher_cell,
+            "_lower_cell":        lower_cell,
+            "existing_focus_fn":  focus_fn_exist,
+            "existing_higher_fn": higher_fn_exist,
+            "existing_lower_fn":  lower_fn_exist,
             "failure_mode":       fm,
             "failure_effect":     fe,
             "failure_cause":      fc,
             "requirement":        "",
-            "existing_focus_fn":  focus_fn_existing,
-            "existing_higher_fn": higher_fn_existing,
-            "existing_lower_fn":  lower_fn_existing,
-            # carry through for output
-            "_severity":    sev,
-            "_classification": cls,
-            "_prevention":  prev,
-            "_occurrence":  occ,
-            "_det_ctrl":    det_ctrl,
-            "_detection":   det,
-            "_ap":          ap,
+            "_severity":          sev,
+            "_classification":    cls,
+            "_prevention":        prev,
+            "_occurrence":        occ,
+            "_det_ctrl":          dc,
+            "_detection":         det,
+            "_ap":                ap,
         })
 
-    # ── Batch derive functions for all rows ───────────────────────────────────
-    fn_results = llm_batch_derive_row_functions(
-        raw_rows_input, focus_element, higher_element, lower_element
-    )
+    if not raw_rows:
+        return {"error": "No data rows found"}
 
-    # ── Build output rows and connections ──────────────────────────────────────
-    rows_out: list[dict] = []
+    # ── Pass 2: Batch-resolve element names ───────────────────────────────────
+    unique_higher = list({r["_higher_cell"] for r in raw_rows if r["_higher_cell"]})
+    unique_lower  = list({r["_lower_cell"]  for r in raw_rows if r["_lower_cell"]})
+
+    higher_map = llm_batch_match_elements(unique_higher, higher_candidates, level="higher") if unique_higher and higher_candidates else {}
+    lower_map  = llm_batch_match_elements(unique_lower,  lower_candidates,  level="lower")  if unique_lower  and lower_candidates  else {}
+
+    # ── Pass 3: Build LLM function-derivation inputs ──────────────────────────
+    llm_inputs: list[dict] = []
+    for r in raw_rows:
+        he = higher_map.get(r["_higher_cell"], higher_candidates[0] if higher_candidates else "Higher System")
+        le = lower_map.get( r["_lower_cell"],  lower_candidates[0]  if lower_candidates  else "Lower Component")
+        r["_higher_element"] = he
+        r["_lower_element"]  = le
+        llm_inputs.append({
+            "focus_element":      focus_element,
+            "higher_element":     he,
+            "lower_element":      le,
+            "failure_mode":       r["failure_mode"],
+            "failure_effect":     r["failure_effect"],
+            "failure_cause":      r["failure_cause"],
+            "requirement":        r["requirement"],
+            "existing_focus_fn":  r["existing_focus_fn"],
+            "existing_higher_fn": r["existing_higher_fn"],
+            "existing_lower_fn":  r["existing_lower_fn"],
+        })
+
+    # ── Pass 4: Batch derive functions ────────────────────────────────────────
+    fn_results = llm_batch_derive_row_functions(llm_inputs)
+
+    # ── Pass 5: Build output rows + connections ────────────────────────────────
+    rows_out:    list[dict] = []
     connections: list[dict] = []
-    noise_accumulator: dict[str, set] = {c: set() for c in _NOISE_CATS}
+    noise_acc:   dict[str, set] = {c: set() for c in _NOISE_CATS}
 
-    for row_idx, (rd, fns) in enumerate(zip(raw_rows_input, fn_results)):
-        if fns is None:
-            fns = {"focus_fn": "", "higher_fn": "", "lower_fn": ""}
+    for row_idx, (r, fns) in enumerate(zip(raw_rows, fn_results)):
+        fns = fns or {"focus_fn": "", "higher_fn": "", "lower_fn": ""}
+        fc  = r["failure_cause"]
+        ni  = classify_cause_noise(fc, use_llm=bool(_BEDROCK_KEY))
+        if ni["noise_driven"] and ni["noise_category"] and ni["noise_factor"]:
+            noise_acc[ni["noise_category"]].add(ni["noise_factor"])
 
-        fc = rd["failure_cause"]
-        noise_info = classify_cause_noise(fc, use_llm=bool(_BEDROCK_KEY))
-        if noise_info["noise_driven"] and noise_info["noise_category"] and noise_info["noise_factor"]:
-            noise_accumulator[noise_info["noise_category"]].add(noise_info["noise_factor"])
-
-        sev = rd["_severity"]
-        occ = rd["_occurrence"]
-        det = rd["_detection"]
+        sev = r["_severity"]
+        occ = r["_occurrence"]
+        det = r["_detection"]
         rpn = (sev or 0) * (occ or 0) * (det or 0) or None
 
         rows_out.append({
             "id":                  _uid(),
             "focus_element":       focus_element,
-            "higher_element":      higher_element,
-            "lower_element":       lower_element,
+            "higher_element":      r["_higher_element"],
+            "lower_element":       r["_lower_element"],
             "higher_fn":           fns["higher_fn"],
             "focus_fn":            fns["focus_fn"],
             "lower_fn":            fns["lower_fn"],
-            "failure_effect":      rd["failure_effect"],
+            "failure_effect":      r["failure_effect"],
             "severity":            sev,
-            "classification":      rd["_classification"],
-            "failure_mode":        rd["failure_mode"],
+            "classification":      r["_classification"],
+            "failure_mode":        r["failure_mode"],
             "failure_cause":       fc,
-            "prevention_controls": rd["_prevention"],
+            "prevention_controls": r["_prevention"],
             "occurrence":          occ,
-            "detection_controls":  rd["_det_ctrl"],
+            "detection_controls":  r["_det_ctrl"],
             "detection":           det,
             "rpn":                 rpn,
-            "ap":                  rd["_ap"],
-            "noise_driven":        noise_info["noise_driven"],
-            "noise_category":      noise_info["noise_category"],
-            "noise_factor":        noise_info["noise_factor"],
+            "ap":                  r["_ap"],
+            "noise_driven":        ni["noise_driven"],
+            "noise_category":      ni["noise_category"],
+            "noise_factor":        ni["noise_factor"],
             "row_index":           row_idx,
         })
 
-        # Connection derived from same row: lower_fn → focus_fn → higher_fn
         if fns["lower_fn"] and fns["focus_fn"] and fns["higher_fn"]:
             connections.append({
-                "lower_fn":  fns["lower_fn"],
-                "focus_fn":  fns["focus_fn"],
-                "higher_fn": fns["higher_fn"],
-                "row_index": row_idx,
+                "lower_element":  r["_lower_element"],
+                "lower_fn":       fns["lower_fn"],
+                "focus_fn":       fns["focus_fn"],
+                "higher_element": r["_higher_element"],
+                "higher_fn":      fns["higher_fn"],
+                "row_index":      row_idx,
             })
 
-    return _assemble_output(
-        rows_out, noise_accumulator, connections,
-        focus_element, higher_element, lower_element,
-        fmt="aiag_vda"
-    )
+    return _assemble_output(rows_out, noise_acc, connections, focus_element, fmt="aiag_vda")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -701,161 +711,166 @@ def parse_aiag_vda(df: pd.DataFrame, col: dict[str, int], elements: dict) -> dic
 
 def parse_legacy(df: pd.DataFrame, col: dict[str, int], elements: dict) -> dict:
     """
-    Parse legacy Ford/GM/Chrysler format.
+    Parse legacy Ford/GM/Chrysler format.  No explicit element columns.
 
-    `elements` must contain: focus_element, higher_element, lower_element.
-    Functions and connections are derived row-by-row via LLM from:
-      - Failure mode  → focus_fn (negation)
-      - Failure effect → higher_fn (what higher element was trying to achieve)
-      - Failure cause → lower_fn (what lower element was supposed to do)
+    Per-row element resolution:
+      - focus_element  : always user-supplied single string
+      - lower_element  : matched from failure_cause text → elements['lower_elements']
+      - higher_element : matched from failure_effect text → elements['higher_elements']
+
+    Functions derived via LLM for all three levels.
     """
-    focus_element  = elements.get("focus_element",  "Focus System")
-    higher_element = elements.get("higher_element", "Higher System")
-    lower_element  = elements.get("lower_element",  "Lower Component")
+    focus_element     = elements["focus_element"]
+    higher_candidates = elements["higher_elements"]
+    lower_candidates  = elements["lower_elements"]
 
-    # ── Pass 1: Forward-fill Item/Function and Requirement columns ─────────────
+    # ── Pass 1: Forward-fill item / requirement columns ───────────────────────
     item_col_idx = col.get("item_function", 0)
     req_col_idx  = col.get("requirement",   1)
+    fe_col_idx   = col.get("failure_effect", -1)
 
-    item_col = df.iloc[:, item_col_idx].apply(_s)
-    req_col  = df.iloc[:, req_col_idx].apply(_s)
-
-    current_item = ""
     items_filled: list[str] = []
-    for v in item_col:
-        if v:
-            current_item = v
-        items_filled.append(current_item)
+    cur = ""
+    for v in df.iloc[:, item_col_idx].apply(_s):
+        if v: cur = v
+        items_filled.append(cur)
 
-    current_req = ""
     reqs_filled: list[str] = []
-    for v in req_col:
-        if v:
-            current_req = v
-        reqs_filled.append(current_req)
+    cur = ""
+    for v in df.iloc[:, req_col_idx].apply(_s):
+        if v: cur = v
+        reqs_filled.append(cur)
 
-    # ── Pass 2: Collect raw rows ───────────────────────────────────────────────
-    fe_col_idx = col.get("failure_effect", -1)
-    raw_rows_input: list[dict] = []
-
+    # ── Pass 2: Collect raw rows ──────────────────────────────────────────────
+    raw_rows: list[dict] = []
     for ri in range(len(df)):
-        fm_val  = _s(df.iloc[ri, col["failure_mode"]])   if "failure_mode"   in col else ""
-        fe_val  = _s(df.iloc[ri, fe_col_idx])            if fe_col_idx >= 0   else ""
-        sev_val = df.iloc[ri, col["severity"]]           if "severity"        in col else None
-        fc_val  = _s(df.iloc[ri, col["failure_cause"]])  if "failure_cause"   in col else ""
-        prev_val = _s(df.iloc[ri, col["prevention"]])    if "prevention"      in col else ""
-        occ_val  = df.iloc[ri, col["occurrence"]]        if "occurrence"      in col else None
-        dc_val   = _s(df.iloc[ri, col["detection_ctrl"]]) if "detection_ctrl" in col else ""
-        det_val  = df.iloc[ri, col["detection"]]         if "detection"       in col else None
-        rpn_val  = df.iloc[ri, col["rpn"]]               if "rpn"             in col else None
-        cls_val  = _s(df.iloc[ri, col["classification"]]) if "classification" in col else ""
+        fm  = _s(df.iloc[ri, col["failure_mode"]])    if "failure_mode"   in col else ""
+        fe  = _s(df.iloc[ri, fe_col_idx])             if fe_col_idx >= 0   else ""
+        sev = df.iloc[ri, col["severity"]]            if "severity"        in col else None
+        fc  = _s(df.iloc[ri, col["failure_cause"]])   if "failure_cause"   in col else ""
+        prv = _s(df.iloc[ri, col["prevention"]])      if "prevention"      in col else ""
+        occ = df.iloc[ri, col["occurrence"]]          if "occurrence"      in col else None
+        dc  = _s(df.iloc[ri, col["detection_ctrl"]])  if "detection_ctrl"  in col else ""
+        det = df.iloc[ri, col["detection"]]           if "detection"       in col else None
+        rpn = df.iloc[ri, col["rpn"]]                 if "rpn"             in col else None
+        cls = _s(df.iloc[ri, col["classification"]])  if "classification"  in col else ""
+        item = items_filled[ri]
+        req  = reqs_filled[ri]
 
-        item_val = items_filled[ri]
-        req_val  = reqs_filled[ri]
-
-        if not item_val or (not fm_val and not fc_val):
+        if not item or (not fm and not fc):
             continue
 
-        sev_int = _int(sev_val)
-        occ_int = _int(occ_val)
-        det_int = _int(det_val)
-        rpn_int = _int(rpn_val) or ((sev_int or 0) * (occ_int or 0) * (det_int or 0) or None)
+        si = _int(sev); oi = _int(occ); di = _int(det)
+        ri_ = _int(rpn) or ((si or 0) * (oi or 0) * (di or 0) or None)
 
-        # In legacy format, function columns are absent — all three are derived
-        raw_rows_input.append({
-            "failure_mode":       fm_val,
-            "failure_effect":     fe_val,
-            "failure_cause":      fc_val,
-            "requirement":        req_val,
-            # Functions are always derived in legacy format
-            "existing_focus_fn":  req_val if req_val and len(req_val) > 5 else "",
-            "existing_higher_fn": "",
-            "existing_lower_fn":  "",
-            # carry through
-            "_item":      item_val,
-            "_severity":  sev_int,
-            "_classification": cls_val,
-            "_prevention": prev_val,
-            "_occurrence": occ_int,
-            "_det_ctrl":  dc_val,
-            "_detection": det_int,
-            "_rpn":       rpn_int,
-            "_row_index": ri,
+        raw_rows.append({
+            "failure_mode":    fm,
+            "failure_effect":  fe,
+            "failure_cause":   fc,
+            "requirement":     req,
+            "_item":           item,
+            "_severity":       si,
+            "_classification": cls,
+            "_prevention":     prv,
+            "_occurrence":     oi,
+            "_det_ctrl":       dc,
+            "_detection":      di,
+            "_rpn":            ri_,
+            "_row_index":      ri,
         })
 
-    # ── Batch derive functions for all rows ───────────────────────────────────
-    fn_results = llm_batch_derive_row_functions(
-        raw_rows_input, focus_element, higher_element, lower_element
-    )
+    if not raw_rows:
+        return {"error": "No data rows found"}
 
-    # ── Build output rows and connections ──────────────────────────────────────
-    rows_out: list[dict] = []
+    # ── Pass 3: Batch-match lower element from cause, higher from effect ───────
+    unique_causes  = list({r["failure_cause"]  for r in raw_rows if r["failure_cause"]})
+    unique_effects = list({r["failure_effect"] for r in raw_rows if r["failure_effect"]})
+
+    lower_map  = llm_batch_match_elements(unique_causes,  lower_candidates,  level="lower")  if unique_causes  and lower_candidates  else {}
+    higher_map = llm_batch_match_elements(unique_effects, higher_candidates, level="higher") if unique_effects and higher_candidates else {}
+
+    # ── Pass 4: Build LLM function-derivation inputs ──────────────────────────
+    llm_inputs: list[dict] = []
+    for r in raw_rows:
+        le = lower_map.get( r["failure_cause"],  lower_candidates[0]  if lower_candidates  else "Lower Component")
+        he = higher_map.get(r["failure_effect"], higher_candidates[0] if higher_candidates else "Higher System")
+        r["_lower_element"]  = le
+        r["_higher_element"] = he
+        llm_inputs.append({
+            "focus_element":      focus_element,
+            "higher_element":     he,
+            "lower_element":      le,
+            "failure_mode":       r["failure_mode"],
+            "failure_effect":     r["failure_effect"],
+            "failure_cause":      r["failure_cause"],
+            "requirement":        r["requirement"],
+            "existing_focus_fn":  r["requirement"] if r["requirement"] and len(r["requirement"]) > 5 else "",
+            "existing_higher_fn": "",
+            "existing_lower_fn":  "",
+        })
+
+    # ── Pass 5: Batch derive functions ────────────────────────────────────────
+    fn_results = llm_batch_derive_row_functions(llm_inputs)
+
+    # ── Pass 6: Build output rows + connections ────────────────────────────────
+    rows_out:    list[dict] = []
     connections: list[dict] = []
-    noise_accumulator: dict[str, set] = {c: set() for c in _NOISE_CATS}
+    noise_acc:   dict[str, set] = {c: set() for c in _NOISE_CATS}
 
-    for row_idx, (rd, fns) in enumerate(zip(raw_rows_input, fn_results)):
-        if fns is None:
-            fns = {"focus_fn": "", "higher_fn": "", "lower_fn": ""}
-
-        fc = rd["failure_cause"]
-        noise_info = classify_cause_noise(fc, use_llm=bool(_BEDROCK_KEY))
-        if noise_info["noise_driven"] and noise_info["noise_category"] and noise_info["noise_factor"]:
-            noise_accumulator[noise_info["noise_category"]].add(noise_info["noise_factor"])
+    for row_idx, (r, fns) in enumerate(zip(raw_rows, fn_results)):
+        fns = fns or {"focus_fn": "", "higher_fn": "", "lower_fn": ""}
+        fc  = r["failure_cause"]
+        ni  = classify_cause_noise(fc, use_llm=bool(_BEDROCK_KEY))
+        if ni["noise_driven"] and ni["noise_category"] and ni["noise_factor"]:
+            noise_acc[ni["noise_category"]].add(ni["noise_factor"])
 
         rows_out.append({
             "id":                  _uid(),
             "focus_element":       focus_element,
-            "higher_element":      higher_element,
-            "lower_element":       lower_element,
+            "higher_element":      r["_higher_element"],
+            "lower_element":       r["_lower_element"],
             "higher_fn":           fns["higher_fn"],
             "focus_fn":            fns["focus_fn"],
             "lower_fn":            fns["lower_fn"],
-            "failure_effect":      rd["failure_effect"],
-            "severity":            rd["_severity"],
-            "classification":      rd["_classification"],
-            "failure_mode":        rd["failure_mode"],
+            "failure_effect":      r["failure_effect"],
+            "severity":            r["_severity"],
+            "classification":      r["_classification"],
+            "failure_mode":        r["failure_mode"],
             "failure_cause":       fc,
-            "prevention_controls": rd["_prevention"],
-            "occurrence":          rd["_occurrence"],
-            "detection_controls":  rd["_det_ctrl"],
-            "detection":           rd["_detection"],
-            "rpn":                 rd["_rpn"],
+            "prevention_controls": r["_prevention"],
+            "occurrence":          r["_occurrence"],
+            "detection_controls":  r["_det_ctrl"],
+            "detection":           r["_detection"],
+            "rpn":                 r["_rpn"],
             "ap":                  None,
-            "noise_driven":        noise_info["noise_driven"],
-            "noise_category":      noise_info["noise_category"],
-            "noise_factor":        noise_info["noise_factor"],
-            "row_index":           rd["_row_index"],
+            "noise_driven":        ni["noise_driven"],
+            "noise_category":      ni["noise_category"],
+            "noise_factor":        ni["noise_factor"],
+            "row_index":           r["_row_index"],
         })
 
-        # Connection from same row: lower_fn → focus_fn → higher_fn
         if fns["lower_fn"] and fns["focus_fn"] and fns["higher_fn"]:
             connections.append({
-                "lower_fn":  fns["lower_fn"],
-                "focus_fn":  fns["focus_fn"],
-                "higher_fn": fns["higher_fn"],
-                "row_index": rd["_row_index"],
+                "lower_element":  r["_lower_element"],
+                "lower_fn":       fns["lower_fn"],
+                "focus_fn":       fns["focus_fn"],
+                "higher_element": r["_higher_element"],
+                "higher_fn":      fns["higher_fn"],
+                "row_index":      r["_row_index"],
             })
 
-    return _assemble_output(
-        rows_out, noise_accumulator, connections,
-        focus_element, higher_element, lower_element,
-        fmt="legacy"
-    )
+    return _assemble_output(rows_out, noise_acc, connections, focus_element, fmt="legacy")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OUTPUT ASSEMBLER  — same schema for both formats
+# OUTPUT ASSEMBLER
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _deduplicate_connections(connections: list[dict]) -> list[dict]:
-    """
-    Remove duplicate connections (same lower_fn → focus_fn → higher_fn triplet).
-    Keeps first occurrence (lowest row_index).
-    """
+def _dedup_connections(connections: list[dict]) -> list[dict]:
     seen: set[tuple] = set()
-    out: list[dict] = []
+    out:  list[dict] = []
     for c in connections:
-        key = (c["lower_fn"], c["focus_fn"], c["higher_fn"])
+        key = (c["lower_element"], c["lower_fn"], c["focus_fn"], c["higher_element"], c["higher_fn"])
         if key not in seen:
             seen.add(key)
             out.append(c)
@@ -867,30 +882,48 @@ def _assemble_output(
     noise_acc: dict[str, set],
     connections: list[dict],
     focus_element: str,
-    higher_element: str,
-    lower_element: str,
     fmt: str,
 ) -> dict:
-    """
-    Collapse raw rows into the canonical output schema.
-    Now includes user-supplied element names and derived connections.
-    """
     if not rows:
         return {"error": "No data rows found"}
 
-    # ── Focus functions (deduplicated) ────────────────────────────────────────
+    # ── Focus functions ───────────────────────────────────────────────────────
     focus_functions = sorted(set(r["focus_fn"] for r in rows if r["focus_fn"]))
 
-    # ── Higher functions (deduplicated) ───────────────────────────────────────
-    higher_functions = sorted(set(r["higher_fn"] for r in rows if r["higher_fn"]))
+    # ── Higher elements → functions (one entry per unique element name) ────────
+    higher_map: dict[str, set] = defaultdict(set)
+    for r in rows:
+        he = r["higher_element"]
+        if he:
+            if r["higher_fn"]:
+                higher_map[he].add(r["higher_fn"])
+            else:
+                higher_map[he]           # ensure key exists even without functions
 
-    # ── Lower functions (deduplicated) ────────────────────────────────────────
-    lower_functions = sorted(set(r["lower_fn"] for r in rows if r["lower_fn"]))
+    higher_elements = [
+        {"name": el, "functions": sorted(fns)}
+        for el, fns in sorted(higher_map.items())
+    ]
 
-    # ── Deduplicated connections ───────────────────────────────────────────────
-    unique_connections = _deduplicate_connections(connections)
+    # ── Lower elements → functions ─────────────────────────────────────────────
+    lower_map: dict[str, set] = defaultdict(set)
+    for r in rows:
+        le = r["lower_element"]
+        if le:
+            if r["lower_fn"]:
+                lower_map[le].add(r["lower_fn"])
+            else:
+                lower_map[le]
 
-    # ── Failure modes grouped by (focus_fn, failure_mode) ────────────────────
+    lower_elements = [
+        {"name": el, "functions": sorted(fns)}
+        for el, fns in sorted(lower_map.items())
+    ]
+
+    # ── Connections (fully qualified with element names) ───────────────────────
+    unique_connections = _dedup_connections(connections)
+
+    # ── Failure modes grouped by (focus_fn, failure_mode) ─────────────────────
     mode_map: dict[tuple, dict] = {}
     for r in rows:
         key = (r["focus_fn"], r["failure_mode"])
@@ -904,9 +937,12 @@ def _assemble_output(
                 "classification": r["classification"],
                 "causes":         [],
             }
-        cause_entry = {
+        ce = {
             "id":                  r["id"],
+            "lower_element":       r["lower_element"],
             "lower_fn":            r["lower_fn"],
+            "higher_element":      r["higher_element"],
+            "higher_fn":           r["higher_fn"],
             "cause_text":          r["failure_cause"],
             "prevention_controls": r["prevention_controls"],
             "detection_controls":  r["detection_controls"],
@@ -918,56 +954,53 @@ def _assemble_output(
             "noise_category":      r["noise_category"],
             "noise_factor":        r["noise_factor"],
         }
-        existing_causes = {c["cause_text"] for c in mode_map[key]["causes"]}
-        if cause_entry["cause_text"] not in existing_causes:
-            mode_map[key]["causes"].append(cause_entry)
+        if ce["cause_text"] not in {c["cause_text"] for c in mode_map[key]["causes"]}:
+            mode_map[key]["causes"].append(ce)
 
     failure_modes = list(mode_map.values())
 
     # ── Noise factors ─────────────────────────────────────────────────────────
     noise_factors = {cat: sorted(items) for cat, items in noise_acc.items()}
 
-    # ── S/O/D summary ─────────────────────────────────────────────────────────
-    sod: dict = {"severities": [], "occurrences": [], "detections": [], "rpns": []}
+    # ── S/O/D summary per lower element ───────────────────────────────────────
+    el_sod: dict[str, dict] = defaultdict(lambda: {"sev": [], "occ": [], "det": [], "rpn": []})
     for r in rows:
-        if r["severity"]  is not None: sod["severities"].append(r["severity"])
-        if r["occurrence"] is not None: sod["occurrences"].append(r["occurrence"])
-        if r["detection"]  is not None: sod["detections"].append(r["detection"])
-        if r["rpn"]        is not None: sod["rpns"].append(r["rpn"])
+        el = r["lower_element"] or focus_element
+        if r["severity"]  is not None: el_sod[el]["sev"].append(r["severity"])
+        if r["occurrence"] is not None: el_sod[el]["occ"].append(r["occurrence"])
+        if r["detection"]  is not None: el_sod[el]["det"].append(r["detection"])
+        if r["rpn"]        is not None: el_sod[el]["rpn"].append(r["rpn"])
 
-    sod_summary = {
-        "max_severity":   max(sod["severities"])  if sod["severities"]  else None,
-        "avg_occurrence": round(sum(sod["occurrences"]) / len(sod["occurrences"]), 1) if sod["occurrences"] else None,
-        "avg_detection":  round(sum(sod["detections"])  / len(sod["detections"]),  1) if sod["detections"]  else None,
-        "max_rpn":        max(sod["rpns"]) if sod["rpns"] else None,
+    sod_by_element = {
+        el: {
+            "max_severity":   max(v["sev"]) if v["sev"] else None,
+            "avg_occurrence": round(sum(v["occ"]) / len(v["occ"]), 1) if v["occ"] else None,
+            "avg_detection":  round(sum(v["det"]) / len(v["det"]), 1) if v["det"] else None,
+            "max_rpn":        max(v["rpn"]) if v["rpn"] else None,
+        }
+        for el, v in el_sod.items()
     }
 
     return {
-        "format_detected":   fmt,
-        # ── User-supplied element names ──
-        "focus_element":     focus_element,
-        "higher_element":    higher_element,
-        "lower_element":     lower_element,
-        # ── Derived functions per level ──
-        "focus_functions":   focus_functions,
-        "higher_functions":  higher_functions,
-        "lower_functions":   lower_functions,
-        # ── Connections (lower_fn → focus_fn → higher_fn) per row ──
-        "connections":       unique_connections,
-        # ── Failure analysis ──
-        "failure_modes":     failure_modes,
-        "noise_factors":     noise_factors,
-        "sod_summary":       sod_summary,
-        "raw_rows":          rows,
+        "format_detected":  fmt,
+        "focus_element":    focus_element,
+        "higher_elements":  higher_elements,    # [{name, functions[]}]
+        "lower_elements":   lower_elements,     # [{name, functions[]}]
+        "focus_functions":  focus_functions,
+        "connections":      unique_connections, # [{lower_element, lower_fn, focus_fn, higher_element, higher_fn, row_index}]
+        "failure_modes":    failure_modes,
+        "noise_factors":    noise_factors,
+        "sod_by_element":   sod_by_element,
+        "raw_rows":         rows,
         "stats": {
-            "total_rows":          len(rows),
-            "failure_mode_count":  len(failure_modes),
-            "focus_function_count": len(focus_functions),
-            "higher_function_count": len(higher_functions),
-            "lower_function_count":  len(lower_functions),
-            "connection_count":    len(unique_connections),
-            "noise_driven_count":  sum(1 for r in rows if r["noise_driven"]),
-            "design_cause_count":  sum(1 for r in rows if not r["noise_driven"]),
+            "total_rows":            len(rows),
+            "failure_mode_count":    len(failure_modes),
+            "focus_function_count":  len(focus_functions),
+            "higher_element_count":  len(higher_elements),
+            "lower_element_count":   len(lower_elements),
+            "connection_count":      len(unique_connections),
+            "noise_driven_count":    sum(1 for r in rows if r["noise_driven"]),
+            "design_cause_count":    sum(1 for r in rows if not r["noise_driven"]),
         },
     }
 
@@ -983,8 +1016,7 @@ def find_dfmea_sheet(xl: dict[str, pd.DataFrame]) -> tuple[str, pd.DataFrame]:
     for name, df in xl.items():
         if any(kw in name.lower() for kw in _DFMEA_SHEET_KEYWORDS):
             return name, df
-    best = max(xl.items(), key=lambda kv: len(kv[1]))
-    return best
+    return max(xl.items(), key=lambda kv: len(kv[1]))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1001,68 +1033,52 @@ def parse_dfmea_file(
 
     Parameters
     ----------
-    path        : path to the xlsx file
-    elements    : dict with keys:
-                    focus_element  — name of the focus system (user-provided)
-                    higher_element — name of the next higher system (user-provided)
-                    lower_element  — name of the next lower component (user-provided)
-    sheet_name  : optional — if None, auto-detected
-
-    Returns
-    -------
-    Canonical output dict (see module docstring for schema).
-
-    NOTE: Element names are NOT inferred from the spreadsheet.
-    They must be collected from the user before calling this function
-    (e.g. via the wizard's Element step in the frontend).
+    path     : path to the xlsx file
+    elements : {
+                  focus_element:   str        — single focus system name
+                  higher_elements: list[str]  — one or more higher system names
+                  lower_elements:  list[str]  — one or more lower component names
+               }
+               ALL values are user-supplied before calling this function.
+               The parser resolves which element applies to each row.
+    sheet_name : optional — if None, auto-detected
     """
-    if not elements or not all(k in elements for k in ("focus_element", "higher_element", "lower_element")):
+    required = ("focus_element", "higher_elements", "lower_elements")
+    if not elements or not all(k in elements for k in required):
         raise ValueError(
-            "parse_dfmea_file() requires an 'elements' dict with keys: "
-            "focus_element, higher_element, lower_element. "
-            "These must be collected from the user before parsing."
+            "elements dict must have: focus_element (str), "
+            "higher_elements (list[str]), lower_elements (list[str])"
         )
+    if not isinstance(elements["higher_elements"], list) or not elements["higher_elements"]:
+        raise ValueError("elements['higher_elements'] must be a non-empty list.")
+    if not isinstance(elements["lower_elements"], list) or not elements["lower_elements"]:
+        raise ValueError("elements['lower_elements'] must be a non-empty list.")
 
     xl = pd.read_excel(path, sheet_name=None, header=None)
-
     if sheet_name and sheet_name in xl:
         df_raw = xl[sheet_name]
     else:
         sheet_name, df_raw = find_dfmea_sheet(xl)
 
-    print(f"[parser] Using sheet: '{sheet_name}'  shape={df_raw.shape}")
-    print(f"[parser] Elements — focus: '{elements['focus_element']}' | "
-          f"higher: '{elements['higher_element']}' | "
-          f"lower: '{elements['lower_element']}'")
+    print(f"[parser] Sheet: '{sheet_name}'  shape={df_raw.shape}")
+    print(f"[parser] Focus   : {elements['focus_element']}")
+    print(f"[parser] Higher  : {elements['higher_elements']}")
+    print(f"[parser] Lower   : {elements['lower_elements']}")
 
-    header_row_idx = find_header_row(df_raw)
-    print(f"[parser] Header row detected at index {header_row_idx}")
-
-    header_values = [_s(v) for v in df_raw.iloc[header_row_idx].tolist()]
-    data_df = df_raw.iloc[header_row_idx + 1:].reset_index(drop=True)
+    hdr_idx       = find_header_row(df_raw)
+    header_values = [_s(v) for v in df_raw.iloc[hdr_idx].tolist()]
+    data_df       = df_raw.iloc[hdr_idx + 1:].reset_index(drop=True)
     data_df.columns = range(data_df.shape[1])
+    data_df       = data_df.dropna(how="all").reset_index(drop=True)
 
     fmt = detect_format(header_values)
-    print(f"[parser] Format detected: {fmt}")
-
     col = map_columns(header_values, fmt)
-    print(f"[parser] Columns mapped: {col}")
+    print(f"[parser] Format={fmt}  Columns={col}")
 
-    data_df = _wrap_df(data_df, col)
-
-    if fmt == "aiag_vda":
-        result = parse_aiag_vda(data_df, col, elements)
-    else:
-        result = parse_legacy(data_df, col, elements)
-
+    result = (parse_aiag_vda if fmt == "aiag_vda" else parse_legacy)(data_df, col, elements)
     result["source_file"] = Path(path).name
     result["sheet_name"]  = sheet_name
     return result
-
-
-def _wrap_df(df: pd.DataFrame, col: dict[str, int]) -> pd.DataFrame:
-    df = df.dropna(how="all").reset_index(drop=True)
-    return df
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1071,118 +1087,117 @@ def _wrap_df(df: pd.DataFrame, col: dict[str, int]) -> pd.DataFrame:
 
 def build_case1_new_conditions(parsed: dict) -> dict:
     """
-    Case 1: Same design, new operating environment.
-    - Keep: elements, functions, connections, failure modes
-    - Strip: noise-driven causes (replace with new noise factors from P-Diagram)
-    - Clear: O and D ratings (environment-dependent)
-    - Keep: S ratings (severity is system-level, independent of environment)
-    - Always treats noise factors as present (new environment assumption)
+    Case 1 — same design, new operating environment.
+    Retains all elements, functions, and connections.
+    Strips noise-driven causes (replaced in P-Diagram step).
+    Clears O/D ratings; retains S ratings.
     """
     rows = parsed.get("raw_rows", [])
-
-    modes_out = []
     seen: set[tuple] = set()
+    modes_out = []
     for r in rows:
         key = (r["focus_fn"], r["failure_mode"])
-        if key not in seen:
-            seen.add(key)
-        is_noise = r.get("noise_driven", True)  # default True for new env
+        seen.add(key)
+        is_noise = r.get("noise_driven", True)
         modes_out.append({
-            "focus_fn":      r["focus_fn"],
-            "failure_mode":  r["failure_mode"],
+            "focus_fn":       r["focus_fn"],
+            "failure_mode":   r["failure_mode"],
             "failure_effect": r["failure_effect"],
-            "severity":      r["severity"],
-            "cause":         None if is_noise else r["failure_cause"],
-            "lower_fn":      r["lower_fn"],
-            "occurrence":    None,
-            "detection":     None,
-            "noise_driven":  is_noise,
-            "noise_label":   r.get("noise_factor"),
+            "severity":       r["severity"],
+            "cause":          None if is_noise else r["failure_cause"],
+            "lower_element":  r["lower_element"],
+            "lower_fn":       r["lower_fn"],
+            "higher_element": r["higher_element"],
+            "higher_fn":      r["higher_fn"],
+            "occurrence":     None,
+            "detection":      None,
+            "noise_driven":   is_noise,
+            "noise_label":    r.get("noise_factor"),
         })
 
-    noise_stripped = sorted(set(
-        r["noise_factor"] for r in rows
-        if r.get("noise_driven") and r.get("noise_factor")
+    stripped = sorted(set(
+        r["noise_factor"] for r in rows if r.get("noise_driven") and r.get("noise_factor")
     ))
 
     return {
         "case":            "new_conditions",
         "focus_element":   parsed["focus_element"],
-        "higher_element":  parsed["higher_element"],
-        "lower_element":   parsed["lower_element"],
-        "focus_functions":  parsed["focus_functions"],
-        "higher_functions": parsed["higher_functions"],
-        "lower_functions":  parsed["lower_functions"],
+        "higher_elements": parsed["higher_elements"],
+        "lower_elements":  parsed["lower_elements"],
+        "focus_functions": parsed["focus_functions"],
         "connections":     parsed["connections"],
         "failure_modes":   modes_out,
         "noise_stub": {
-            "stripped_factors": noise_stripped,
+            "stripped_factors": stripped,
             "instructions": (
-                "These noise factors came from the original operating environment. "
-                "Replace with your new conditions in the P-Diagram step. "
-                "Noise-driven causes will be re-generated from new noise factors."
+                "Replace these with your new operating-environment noise factors "
+                "in the P-Diagram step."
             ),
         },
         "stats": {
-            "modes":             len(seen),
-            "connections":       len(parsed["connections"]),
-            "causes_retained":   sum(1 for r in rows if not r.get("noise_driven")),
-            "causes_stripped":   sum(1 for r in rows if r.get("noise_driven")),
+            "modes":           len(seen),
+            "connections":     len(parsed["connections"]),
+            "higher_elements": len(parsed["higher_elements"]),
+            "lower_elements":  len(parsed["lower_elements"]),
+            "causes_retained": sum(1 for r in rows if not r.get("noise_driven")),
+            "causes_stripped": sum(1 for r in rows if r.get("noise_driven")),
         },
     }
 
 
 def build_case2_modified_design(parsed: dict, modified_elements: list[str] | None = None) -> dict:
     """
-    Case 2: Same environment, modified component(s).
-    - Keep: elements, functions, connections, noise-driven causes (with S/O/D)
-    - Strip: design-mechanism causes for modified elements only
-    - Re-generate: causes for modified elements via LLM
-    - User must re-define modified elements and their functions before re-gen
+    Case 2 — same environment, modified component(s).
+    Strips design-mechanism causes for modified lower elements.
+    Noise-driven causes always retained.
+    User must re-define modified elements before LLM re-generation.
     """
     rows = parsed.get("raw_rows", [])
-    modified_set = set(modified_elements or [])
+    mod_set = set(modified_elements or [])
 
     modes_out = []
     for r in rows:
-        is_modified = bool(modified_set) and (r["lower_element"] in modified_set)
-        is_noise    = r.get("noise_driven", False)
-        retain = is_noise or not is_modified
+        is_mod   = bool(mod_set) and r["lower_element"] in mod_set
+        is_noise = r.get("noise_driven", False)
+        retain   = is_noise or not is_mod
         modes_out.append({
-            "focus_fn":       r["focus_fn"],
-            "failure_mode":   r["failure_mode"],
-            "failure_effect": r["failure_effect"],
-            "severity":       r["severity"],
-            "cause":          r["failure_cause"] if retain else None,
-            "lower_fn":       r["lower_fn"],
-            "occurrence":     r["occurrence"] if retain else None,
-            "detection":      r["detection"]  if retain else None,
-            "rpn":            r["rpn"]         if retain else None,
-            "noise_driven":   is_noise,
-            "retained":       retain,
-            "needs_regen":    not retain,
-            "modified_element": is_modified,
+            "focus_fn":         r["focus_fn"],
+            "failure_mode":     r["failure_mode"],
+            "failure_effect":   r["failure_effect"],
+            "severity":         r["severity"],
+            "cause":            r["failure_cause"] if retain else None,
+            "lower_element":    r["lower_element"],
+            "lower_fn":         r["lower_fn"],
+            "higher_element":   r["higher_element"],
+            "higher_fn":        r["higher_fn"],
+            "occurrence":       r["occurrence"] if retain else None,
+            "detection":        r["detection"]  if retain else None,
+            "rpn":              r["rpn"]         if retain else None,
+            "noise_driven":     is_noise,
+            "retained":         retain,
+            "needs_regen":      not retain,
+            "modified_element": is_mod,
         })
 
     return {
         "case":             "modified_design",
         "focus_element":    parsed["focus_element"],
-        "higher_element":   parsed["higher_element"],
-        "lower_element":    parsed["lower_element"],
+        "higher_elements":  parsed["higher_elements"],
+        "lower_elements":   parsed["lower_elements"],
         "focus_functions":  parsed["focus_functions"],
-        "higher_functions": parsed["higher_functions"],
-        "lower_functions":  parsed["lower_functions"],
         "connections":      parsed["connections"],
         "noise_factors":    parsed["noise_factors"],
         "failure_modes":    modes_out,
-        "modified_elements": list(modified_set) or "user_to_specify",
+        "modified_elements": list(mod_set) or "user_to_specify",
         "user_action_required": (
-            "Please re-define the modified elements and their functions "
-            "before regenerating failure causes for those components."
+            "Re-define modified elements and their functions before "
+            "regenerating failure causes."
         ),
         "stats": {
             "total_rows":          len(rows),
             "connections":         len(parsed["connections"]),
+            "higher_elements":     len(parsed["higher_elements"]),
+            "lower_elements":      len(parsed["lower_elements"]),
             "causes_retained":     sum(1 for m in modes_out if m["retained"]),
             "causes_stripped":     sum(1 for m in modes_out if not m["retained"]),
             "modes_needing_regen": sum(1 for m in modes_out if m["needs_regen"]),
@@ -1197,63 +1212,66 @@ def build_case2_modified_design(parsed: dict, modified_elements: list[str] | Non
 def print_report(parsed: dict) -> None:
     print("\n" + "=" * 72)
     print(f"  UNIVERSAL DFMEA PARSER REPORT")
-    print(f"  Source : {parsed.get('source_file', '—')}")
-    print(f"  Sheet  : {parsed.get('sheet_name',  '—')}")
+    print(f"  Source : {parsed.get('source_file', '—')}  |  Sheet: {parsed.get('sheet_name','—')}")
     print(f"  Format : {parsed.get('format_detected', '—').upper()}")
     print("=" * 72)
 
-    print(f"\n  Element hierarchy (user-supplied):")
-    print(f"    Higher : {parsed['higher_element']}")
-    print(f"    Focus  : {parsed['focus_element']}")
-    print(f"    Lower  : {parsed['lower_element']}")
+    print(f"\n  Focus: {parsed['focus_element']}")
 
-    print(f"\n  Higher functions ({len(parsed['higher_functions'])}):")
-    for fn in parsed["higher_functions"][:5]:
-        print(f"    · {fn[:80]}")
+    print(f"\n  Higher elements ({len(parsed['higher_elements'])}):")
+    for he in parsed["higher_elements"]:
+        print(f"    · {he['name']}")
+        for fn in he["functions"][:3]:
+            print(f"        – {fn[:80]}")
+
+    print(f"\n  Lower elements ({len(parsed['lower_elements'])}):")
+    for le in parsed["lower_elements"]:
+        sod = parsed.get("sod_by_element", {}).get(le["name"], {})
+        print(f"    · {le['name']}  "
+              f"[S={sod.get('max_severity')} O={sod.get('avg_occurrence')} "
+              f"D={sod.get('avg_detection')} RPN={sod.get('max_rpn')}]")
+        for fn in le["functions"][:2]:
+            print(f"        – {fn[:80]}")
 
     print(f"\n  Focus functions ({len(parsed['focus_functions'])}):")
     for fn in parsed["focus_functions"][:5]:
         print(f"    · {fn[:80]}")
 
-    print(f"\n  Lower functions ({len(parsed['lower_functions'])}):")
-    for fn in parsed["lower_functions"][:5]:
-        print(f"    · {fn[:80]}")
-
-    print(f"\n  Connections (lower_fn → focus_fn → higher_fn) [{len(parsed['connections'])} unique]:")
+    print(f"\n  Connections [{len(parsed['connections'])} unique]:")
     for c in parsed["connections"][:5]:
-        print(f"    [row {c['row_index']}]")
-        print(f"      {c['lower_fn'][:50]}")
-        print(f"      → {c['focus_fn'][:50]}")
-        print(f"      → {c['higher_fn'][:50]}")
+        print(f"    [row {c['row_index']}]  {c['lower_element']} → focus → {c['higher_element']}")
+        print(f"      {c['lower_fn'][:55]}")
+        print(f"      → {c['focus_fn'][:55]}")
+        print(f"      → {c['higher_fn'][:55]}")
     if len(parsed["connections"]) > 5:
-        print(f"    … and {len(parsed['connections']) - 5} more connections")
+        print(f"    … {len(parsed['connections']) - 5} more")
 
     print(f"\n  Failure modes ({len(parsed['failure_modes'])}):")
-    for mode in parsed["failure_modes"][:5]:
-        causes = mode.get("causes", [])
-        print(f"    · [{mode['focus_fn'][:40]}]  →  {mode['failure_mode'][:60]}")
-        print(f"      S={mode['severity']}  effect: {mode['failure_effect'][:60]}")
-        print(f"      Causes: {len(causes)} total  ({sum(1 for c in causes if c.get('noise_driven'))} noise-driven)")
+    for m in parsed["failure_modes"][:5]:
+        cs = m["causes"]
+        print(f"    · {m['failure_mode'][:60]}  (S={m['severity']})")
+        print(f"      {len(cs)} causes  ({sum(1 for c in cs if c.get('noise_driven'))} noise)")
     if len(parsed["failure_modes"]) > 5:
-        print(f"    … and {len(parsed['failure_modes']) - 5} more modes")
+        print(f"    … {len(parsed['failure_modes']) - 5} more")
 
-    print(f"\n  Noise factors extracted:")
-    for cat, factors in parsed["noise_factors"].items():
-        if factors:
-            print(f"    [{cat}]")
-            for f in factors:
-                print(f"        · {f}")
+    print(f"\n  Noise factors:")
+    for cat, facs in parsed["noise_factors"].items():
+        if facs:
+            print(f"    [{cat}]: {', '.join(facs[:4])}")
 
     s = parsed["stats"]
-    print(f"\n  Stats: {s['total_rows']} rows | {s['failure_mode_count']} modes | "
-          f"{s['focus_function_count']} focus fns | {s['lower_function_count']} lower fns | "
-          f"{s['connection_count']} connections | "
-          f"{s['noise_driven_count']} noise causes | {s['design_cause_count']} design causes")
+    print(
+        f"\n  {s['total_rows']} rows | {s['failure_mode_count']} modes | "
+        f"{s['focus_function_count']} focus fns | "
+        f"{s['higher_element_count']} higher els | {s['lower_element_count']} lower els | "
+        f"{s['connection_count']} connections | "
+        f"{s['noise_driven_count']} noise / {s['design_cause_count']} design causes"
+    )
     print("=" * 72)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FASTAPI ROUTER  (drop into routers/ folder, register in main.py)
+# FASTAPI ROUTER  (uncomment and register in main.py)
 # ─────────────────────────────────────────────────────────────────────────────
 
 # from fastapi import APIRouter, UploadFile, File, Form
@@ -1263,30 +1281,26 @@ def print_report(parsed: dict) -> None:
 #
 # @router.post("/api/dfmea/import/parse")
 # async def import_parse(
-#     file: UploadFile = File(...),
-#     focus_element: str = Form(...),      # REQUIRED — collected from wizard Step 1
-#     higher_element: str = Form(...),     # REQUIRED — collected from wizard Step 1
-#     lower_element: str = Form(...),      # REQUIRED — collected from wizard Step 1
-#     case: str = Form("new_conditions"),  # "new_conditions" | "modified_design"
-#     modified_elements: str = Form(""),   # comma-separated list
-#     sheet_name: str = Form(""),
+#     file:              UploadFile = File(...),
+#     focus_element:     str = Form(...),   # wizard Step 1 — single string
+#     higher_elements:   str = Form(...),   # comma-separated, e.g. "Chassis,Frame"
+#     lower_elements:    str = Form(...),   # comma-separated, e.g. "Differential,Hub,Axle Shaft"
+#     case:              str = Form("new_conditions"),
+#     modified_elements: str = Form(""),    # comma-separated subset of lower_elements
+#     sheet_name:        str = Form(""),
 # ):
 #     elements = {
-#         "focus_element":  focus_element,
-#         "higher_element": higher_element,
-#         "lower_element":  lower_element,
+#         "focus_element":   focus_element,
+#         "higher_elements": [e.strip() for e in higher_elements.split(",") if e.strip()],
+#         "lower_elements":  [e.strip() for e in lower_elements.split(",")  if e.strip()],
 #     }
 #     with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
 #         shutil.copyfileobj(file.file, tmp)
 #         tmp_path = tmp.name
-#
-#     parsed = parse_dfmea_file(tmp_path, elements=elements, sheet_name=sheet_name or None)
+#     parsed  = parse_dfmea_file(tmp_path, elements=elements, sheet_name=sheet_name or None)
 #     mod_els = [e.strip() for e in modified_elements.split(",") if e.strip()]
-#
-#     if case == "modified_design":
-#         return build_case2_modified_design(parsed, mod_els or None)
-#     else:
-#         return build_case1_new_conditions(parsed)
+#     return (build_case2_modified_design(parsed, mod_els or None)
+#             if case == "modified_design" else build_case1_new_conditions(parsed))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1296,50 +1310,34 @@ def print_report(parsed: dict) -> None:
 if __name__ == "__main__":
     import sys
 
-    path = (
-        sys.argv[1]
-        if len(sys.argv) > 1
-        else "/mnt/user-data/uploads/1-Chassis_System-Axle_System_DFMEA_v4_Final__3_.xlsx"
+    path  = sys.argv[1] if len(sys.argv) > 1 else (
+        "/mnt/user-data/uploads/1-Chassis_System-Axle_System_DFMEA_v4_Final__3_.xlsx"
     )
     sheet = sys.argv[2] if len(sys.argv) > 2 else None
 
-    # ── Elements MUST be provided by user — collect from CLI for testing ───────
-    print("\n[parser] Element names must be provided by the user.")
-    print("         In production these come from the wizard's Element step.\n")
-
-    focus_element  = input("  Focus element name  (e.g. 'Axle System')          : ").strip()
-    higher_element = input("  Higher element name (e.g. 'Chassis')               : ").strip()
-    lower_element  = input("  Lower element name  (e.g. 'Differential Assembly') : ").strip()
+    print("\n[parser] Collect element names (from wizard Step 1 in production)\n")
+    focus_el  = input("  Focus element name                         : ").strip() or "Focus System"
+    higher_raw = input("  Higher element names (comma-separated)     : ").strip()
+    lower_raw  = input("  Lower element names  (comma-separated)     : ").strip()
 
     elements = {
-        "focus_element":  focus_element  or "Focus System",
-        "higher_element": higher_element or "Higher System",
-        "lower_element":  lower_element  or "Lower Component",
+        "focus_element":   focus_el,
+        "higher_elements": [e.strip() for e in higher_raw.split(",") if e.strip()] or ["Higher System"],
+        "lower_elements":  [e.strip() for e in lower_raw.split(",")  if e.strip()] or ["Lower Component"],
     }
 
-    print(f"\n[parser] Parsing: {path}")
     parsed = parse_dfmea_file(path, elements=elements, sheet_name=sheet)
-
     print_report(parsed)
 
-    out_dir = Path("/outputs")
-    out_dir.mkdir(exist_ok=True)
-
-    (out_dir / "universal_parsed_full.json").write_text(
+    out = Path("/outputs")
+    out.mkdir(exist_ok=True)
+    (out / "universal_parsed_full.json").write_text(
         json.dumps(parsed, indent=2, default=str), encoding="utf-8"
     )
-
-    case1 = build_case1_new_conditions(parsed)
-    (out_dir / "universal_case1_new_conditions.json").write_text(
-        json.dumps(case1, indent=2, default=str), encoding="utf-8"
+    (out / "universal_case1_new_conditions.json").write_text(
+        json.dumps(build_case1_new_conditions(parsed), indent=2, default=str), encoding="utf-8"
     )
-
-    case2 = build_case2_modified_design(parsed, modified_elements=None)
-    (out_dir / "universal_case2_modified_design.json").write_text(
-        json.dumps(case2, indent=2, default=str), encoding="utf-8"
+    (out / "universal_case2_modified_design.json").write_text(
+        json.dumps(build_case2_modified_design(parsed), indent=2, default=str), encoding="utf-8"
     )
-
-    print(f"\n[parser] Outputs written to {out_dir}:")
-    print("  · universal_parsed_full.json")
-    print("  · universal_case1_new_conditions.json")
-    print("  · universal_case2_modified_design.json")
+    print(f"\n[parser] Outputs written to {out}")
