@@ -6,16 +6,24 @@ header fingerprinting:
   FORMAT A — AIAG-VDA 2019  (IIT Madras / Ashok Leyland new format)
     Explicit higher / focus / lower element columns per row.
     Function columns present for all three levels.
-    LLM used for: resolving per-row element names + deriving missing functions
-                  + noise classification.
+    LLM used for: resolving per-row element names (batch fuzzy+LLM match) +
+                  deriving missing functions (batch) +
+                  noise classification (per-row).
 
   FORMAT B — Legacy Ford/GM/Chrysler  (Ashok Leyland production format)
     Single "Item / Function" column.  No element columns.
-    LLM used for:
-      - Match cause text  → lower element  (from user-supplied list)
-      - Match effect text → higher element (from user-supplied list)
-      - Derive focus / higher / lower function statements per row
-      - Classify noise factors
+    LLM used for (2 calls per row — no batch to avoid timeouts):
+      Call 1: Parse focus / lower / higher element names from row text,
+              then match each to user-supplied candidate lists.
+      Call 2: Derive focus_fn / higher_fn / lower_fn, preserving causal chain.
+      Call 3: Classify noise factors from failure cause text.
+
+WORKFLOW:
+  1. User provides: lower_elements list, focus_element, higher_elements list
+  2. File format is detected via header fingerprinting
+  3. Legacy: per-row element parsing + matching (2 LLM calls) then noise (1 LLM call)
+     AIAG:   batch element matching + batch function derivation + per-row noise
+  4. Output: elements at each level with their functions + noise factors
 
 IMPORTANT: Element names are NOT inferred by the parser.
 They must be provided by the caller:
@@ -353,6 +361,143 @@ Output ONLY a valid JSON array with one object per cell value, in order:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# LEGACY PER-ROW LLM CALLS  (2 calls per row — no batching to avoid timeouts)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _llm_legacy_parse_elements(
+    row: dict,
+    focus_element: str,
+    higher_candidates: list[str],
+    lower_candidates: list[str],
+) -> dict:
+    """
+    LLM Call 1 of 2 per legacy row.
+
+    Parses: focus element name, lower element name, higher element name
+    from the raw row text (item/function, failure_cause, failure_effect).
+    Returns {focus_element, lower_element, higher_element} matched to
+    user-supplied candidate lists.
+    """
+    # Fast-path fuzzy match first — only call LLM if needed
+    lower_fuzzy  = _fuzzy_match(row.get("failure_cause",  ""), lower_candidates)
+    higher_fuzzy = _fuzzy_match(row.get("failure_effect", ""), higher_candidates)
+
+    if lower_fuzzy and higher_fuzzy:
+        return {
+            "focus_element":  focus_element,
+            "lower_element":  lower_fuzzy,
+            "higher_element": higher_fuzzy,
+        }
+
+    prompt = f"""You are analysing one row of a legacy DFMEA spreadsheet.
+
+User-supplied element names:
+  Focus element   : "{focus_element}"
+  Higher elements : {json.dumps(higher_candidates)}
+  Lower elements  : {json.dumps(lower_candidates)}
+
+Row data:
+  Item / Function : "{row.get('_item', '')}"
+  Requirement     : "{row.get('requirement', '')}"
+  Failure mode    : "{row.get('failure_mode', '')}"
+  Failure effect  : "{row.get('failure_effect', '')}"
+  Failure cause   : "{row.get('failure_cause', '')}"
+
+Tasks:
+1. Identify which HIGHER element (from the list) is impacted by the failure effect.
+2. Identify which LOWER element (from the list) is the source of the failure cause.
+3. The focus element is always "{focus_element}".
+
+Return ONLY valid JSON — no extra text:
+{{
+  "focus_element":  "{focus_element}",
+  "higher_element": "<exact name from higher elements list>",
+  "lower_element":  "<exact name from lower elements list>"
+}}"""
+
+    raw  = _llm(prompt, "_llm_legacy_parse_elements", max_tokens=150)
+    data = _parse_json(raw)
+
+    # Validate and fallback
+    he = data.get("higher_element", "")
+    le = data.get("lower_element",  "")
+
+    if he not in higher_candidates:
+        he = higher_fuzzy or _fuzzy_match(he, higher_candidates) or higher_candidates[0]
+    if le not in lower_candidates:
+        le = lower_fuzzy or _fuzzy_match(le, lower_candidates) or lower_candidates[0]
+
+    return {
+        "focus_element":  focus_element,
+        "higher_element": he,
+        "lower_element":  le,
+    }
+
+
+def _llm_legacy_parse_functions(
+    row: dict,
+    focus_element: str,
+    higher_element: str,
+    lower_element: str,
+) -> dict:
+    """
+    LLM Call 2 of 2 per legacy row.
+
+    Derives function statements for focus, higher, and lower elements
+    from the row context, preserving connections between them.
+    Returns {focus_fn, higher_fn, lower_fn}.
+    """
+    # If requirement cell already looks like a function statement, use it as focus_fn hint
+    req = row.get("requirement", "")
+    existing_focus_fn = req if req and len(req) > 5 else ""
+
+    if existing_focus_fn:
+        fields = ['  "higher_fn": "<function of higher element>"',
+                  '  "lower_fn":  "<function of lower element>"']
+        existing_note = f'\n  existing_focus_fn (echo unchanged): "{existing_focus_fn}"'
+    else:
+        fields = ['  "focus_fn":  "<function of focus element>"',
+                  '  "higher_fn": "<function of higher element>"',
+                  '  "lower_fn":  "<function of lower element>"']
+        existing_note = ""
+
+    prompt = f"""Derive DFMEA function statements for one row.
+
+Elements:
+  Higher : "{higher_element}"
+  Focus  : "{focus_element}"
+  Lower  : "{lower_element}"{existing_note}
+
+Row data:
+  Item / Function : "{row.get('_item', '')}"
+  Requirement     : "{req}"
+  Failure mode    : "{row.get('failure_mode', '')}"
+  Failure effect  : "{row.get('failure_effect', '')}"
+  Failure cause   : "{row.get('failure_cause', '')}"
+
+Rules:
+- focus_fn  : positive function of "{focus_element}" that the failure_mode violates
+- higher_fn : positive function of "{higher_element}" impaired by the failure_effect
+- lower_fn  : positive function of "{lower_element}" negated by the failure_cause
+- Format: verb + object, ≤12 words (e.g. "Transmit braking torque to wheel hub")
+- Preserve the causal chain: lower_fn → focus_fn → higher_fn
+
+Return ONLY valid JSON:
+{{
+{chr(10).join(fields)}{(',' + chr(10) + '  "focus_fn": "' + existing_focus_fn + '"') if existing_focus_fn else ''}
+}}"""
+
+    raw  = _llm(prompt, "_llm_legacy_parse_functions", max_tokens=200)
+    data = _parse_json(raw)
+
+    return {
+        "focus_fn":  data.get("focus_fn",  existing_focus_fn),
+        "higher_fn": data.get("higher_fn", ""),
+        "lower_fn":  data.get("lower_fn",  ""),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # NOISE CLASSIFICATION
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -562,11 +707,12 @@ def parse_aiag_vda(df: pd.DataFrame, col: dict[str, int], elements: dict) -> dic
     Per-row element resolution:
       - focus_element  : always user-supplied single string
       - higher_element : read from 'next higher level element' column → matched to
-                         elements['higher_elements'] list via fuzzy + LLM
+                         elements['higher_elements'] list via fuzzy + LLM batch
       - lower_element  : read from 'next lower level element' column  → matched to
-                         elements['lower_elements']  list via fuzzy + LLM
+                         elements['lower_elements']  list via fuzzy + LLM batch
 
-    Functions read from explicit columns if present, else LLM-derived.
+    Functions read from explicit columns if present, else LLM-derived (batch).
+    Noise factors derived per-row (individual LLM call per cause).
     Connections built from row co-occurrence with fully qualified element names.
     """
     focus_element     = elements["focus_element"]
@@ -713,12 +859,13 @@ def parse_legacy(df: pd.DataFrame, col: dict[str, int], elements: dict) -> dict:
     """
     Parse legacy Ford/GM/Chrysler format.  No explicit element columns.
 
-    Per-row element resolution:
-      - focus_element  : always user-supplied single string
-      - lower_element  : matched from failure_cause text → elements['lower_elements']
-      - higher_element : matched from failure_effect text → elements['higher_elements']
+    Per-row element resolution (2 LLM calls per row — no batching):
+      Call 1: Parse focus / lower / higher element names from row text,
+              then match each to user-supplied candidate lists.
+      Call 2: Derive focus_fn / lower_fn / higher_fn, preserving connections.
+      Call 3: Classify noise factors from failure cause.
 
-    Functions derived via LLM for all three levels.
+    Output: elements at each level with their functions, plus noise factors.
     """
     focus_element     = elements["focus_element"]
     higher_candidates = elements["higher_elements"]
@@ -782,53 +929,44 @@ def parse_legacy(df: pd.DataFrame, col: dict[str, int], elements: dict) -> dict:
     if not raw_rows:
         return {"error": "No data rows found"}
 
-    # ── Pass 3: Batch-match lower element from cause, higher from effect ───────
-    unique_causes  = list({r["failure_cause"]  for r in raw_rows if r["failure_cause"]})
-    unique_effects = list({r["failure_effect"] for r in raw_rows if r["failure_effect"]})
-
-    lower_map  = llm_batch_match_elements(unique_causes,  lower_candidates,  level="lower")  if unique_causes  and lower_candidates  else {}
-    higher_map = llm_batch_match_elements(unique_effects, higher_candidates, level="higher") if unique_effects and higher_candidates else {}
-
-    # ── Pass 4: Build LLM function-derivation inputs ──────────────────────────
-    llm_inputs: list[dict] = []
-    for r in raw_rows:
-        le = lower_map.get( r["failure_cause"],  lower_candidates[0]  if lower_candidates  else "Lower Component")
-        he = higher_map.get(r["failure_effect"], higher_candidates[0] if higher_candidates else "Higher System")
-        r["_lower_element"]  = le
-        r["_higher_element"] = he
-        llm_inputs.append({
-            "focus_element":      focus_element,
-            "higher_element":     he,
-            "lower_element":      le,
-            "failure_mode":       r["failure_mode"],
-            "failure_effect":     r["failure_effect"],
-            "failure_cause":      r["failure_cause"],
-            "requirement":        r["requirement"],
-            "existing_focus_fn":  r["requirement"] if r["requirement"] and len(r["requirement"]) > 5 else "",
-            "existing_higher_fn": "",
-            "existing_lower_fn":  "",
-        })
-
-    # ── Pass 5: Batch derive functions ────────────────────────────────────────
-    fn_results = llm_batch_derive_row_functions(llm_inputs)
-
-    # ── Pass 6: Build output rows + connections ────────────────────────────────
+    # ── Pass 3: Per-row: LLM call 1 (element names) + LLM call 2 (functions) ──
+    # Two separate LLM calls per row — no batching — to avoid timeout issues.
     rows_out:    list[dict] = []
     connections: list[dict] = []
     noise_acc:   dict[str, set] = {c: set() for c in _NOISE_CATS}
 
-    for row_idx, (r, fns) in enumerate(zip(raw_rows, fn_results)):
-        fns = fns or {"focus_fn": "", "higher_fn": "", "lower_fn": ""}
-        fc  = r["failure_cause"]
-        ni  = classify_cause_noise(fc, use_llm=bool(_BEDROCK_KEY))
+    for row_idx, r in enumerate(raw_rows):
+        # ── LLM Call 1: Parse + match element names ───────────────────────────
+        el_result = _llm_legacy_parse_elements(
+            row=r,
+            focus_element=focus_element,
+            higher_candidates=higher_candidates,
+            lower_candidates=lower_candidates,
+        )
+        he = el_result["higher_element"]
+        le = el_result["lower_element"]
+        r["_higher_element"] = he
+        r["_lower_element"]  = le
+
+        # ── LLM Call 2: Derive function statements ────────────────────────────
+        fns = _llm_legacy_parse_functions(
+            row=r,
+            focus_element=focus_element,
+            higher_element=he,
+            lower_element=le,
+        )
+
+        # ── LLM Call 3: Classify noise factors ───────────────────────────────
+        fc = r["failure_cause"]
+        ni = classify_cause_noise(fc, use_llm=bool(_BEDROCK_KEY))
         if ni["noise_driven"] and ni["noise_category"] and ni["noise_factor"]:
             noise_acc[ni["noise_category"]].add(ni["noise_factor"])
 
         rows_out.append({
             "id":                  _uid(),
             "focus_element":       focus_element,
-            "higher_element":      r["_higher_element"],
-            "lower_element":       r["_lower_element"],
+            "higher_element":      he,
+            "lower_element":       le,
             "higher_fn":           fns["higher_fn"],
             "focus_fn":            fns["focus_fn"],
             "lower_fn":            fns["lower_fn"],
@@ -851,13 +989,19 @@ def parse_legacy(df: pd.DataFrame, col: dict[str, int], elements: dict) -> dict:
 
         if fns["lower_fn"] and fns["focus_fn"] and fns["higher_fn"]:
             connections.append({
-                "lower_element":  r["_lower_element"],
+                "lower_element":  le,
                 "lower_fn":       fns["lower_fn"],
                 "focus_fn":       fns["focus_fn"],
-                "higher_element": r["_higher_element"],
+                "higher_element": he,
                 "higher_fn":      fns["higher_fn"],
                 "row_index":      r["_row_index"],
             })
+
+        print(
+            f"[legacy] row {row_idx + 1}/{len(raw_rows)}  "
+            f"lower={le!r}  higher={he!r}  "
+            f"focus_fn={fns['focus_fn'][:40]!r}"
+        )
 
     return _assemble_output(rows_out, noise_acc, connections, focus_element, fmt="legacy")
 
